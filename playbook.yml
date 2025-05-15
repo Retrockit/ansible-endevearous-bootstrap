@@ -1,0 +1,765 @@
+---
+# arch_setup.yml
+# Arch Linux System Setup Playbook
+# ================================
+#
+# Copyright (c) 2025 SolutionMonk
+# MIT License
+#
+# This playbook automates the installation of commonly used tools on Arch Linux.
+# It is designed to be idempotent and maintainable, allowing easy addition and 
+# removal of tools.
+
+- name: Arch Linux System Setup
+  hosts: all
+  become: true
+  gather_facts: true
+  vars:
+    current_user: "{{ ansible_user_id }}"
+    user_home: "/home/{{ current_user }}"
+    log_marker: ">>>"
+    containers_registries_conf: "/etc/containers/registries.conf"
+    jetbrains_install_dir: "{{ user_home }}/.local/share/JetBrains/Toolbox/bin"
+    jetbrains_symlink_dir: "{{ user_home }}/.local/bin"
+    mise_installer: "https://mise.run"
+    flathub_repo: "https://flathub.org/repo/flathub.flatpakrepo"
+
+    # Package arrays - customize these according to your needs (Arch Linux package names)
+    system_packages:
+      - "base-devel"
+      - "curl"
+      - "gnupg"
+      - "wget"
+      - "fuse2"  # For AppImage support
+
+    dev_packages:
+      - "base-devel"    # Meta-package that includes gcc, make, patch, etc.
+
+    util_packages:
+      - "htop"
+      - "tmux"
+      - "tree"
+      - "unzip"
+      - "fish"
+
+    # List of AUR packages to install
+    aur_packages:
+      - "visual-studio-code-bin"
+      - "google-chrome"
+      - "jetbrains-toolbox"
+      - "1password"
+      - "1password-cli"
+
+    # Flatpak packages
+    flatpak_packages:
+      - "flatpak"
+
+    # list of Flatpak apps to install
+    flatpak_apps:
+      - "info.smplayer.SMPlayer"             # SMPlayer
+      - "com.discordapp.Discord"             # Discord
+      - "com.slack.Slack"                    # Slack
+      - "org.telegram.desktop"               # Telegram
+      - "com.github.tchx84.Flatseal"         # Flatseal (Flatpak permissions manager)
+      - "org.gimp.GIMP"                      # GIMP
+      - "it.mijorus.gearlever"               # Gear Lever
+      - "org.duckstation.DuckStation"        # DuckStation
+      - "org.DolphinEmu.dolphin-emu"         # Dolphin Emulator
+      - "net.pcsx2.PCSX2"                    # PCSX2
+      - "io.github.mhogomchungu.media-downloader" # Media Downloader
+      - "com.valvesoftware.Steam"            # Steam
+
+    # Lua build dependencies
+    lua_dependencies:
+      - "base-devel"
+      - "readline"
+
+    # Docker and Podman packages
+    docker_packages:
+      - "docker"
+      - "docker-buildx"
+      - "docker-compose"
+
+    podman_packages:
+      - "podman"
+
+    # KVM/libvirt packages - minimal required set
+    kvm_packages:
+      - "libvirt"       # Virtualization API
+      - "virt-manager"  # GUI management tool
+      - "qemu-full"     # QEMU with all features
+      - "dnsmasq"       # DNS/DHCP for virtual networks
+      - "dmidecode"     # System information retrieval tool
+
+  # Log all output to a file
+  tasks:
+    # SECTION: SYSTEM SETUP AND UPDATES
+    # =================================
+    - name: Create timestamped log file
+      ansible.builtin.set_fact:
+        log_file: "/tmp/ansible_arch_setup_{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}.log"
+      
+    - name: Setup logging
+      ansible.builtin.file:
+        path: "{{ log_file }}"
+        state: touch
+        mode: '0644'
+        owner: root
+        group: root
+
+    - name: Update SSL certificates
+      block:
+        - name: Update certificate trust anchors
+          ansible.builtin.command: update-ca-trust extract
+          changed_when: true
+          register: cert_update_result
+
+        - name: Test certificate by downloading a test file
+          ansible.builtin.uri:
+            url: https://www.archlinux.org
+            return_content: false
+            validate_certs: true
+          ignore_errors: true
+          register: cert_test_result
+
+        - name: Apply certificate fix if initial update failed
+          block:
+            - name: Download updated packages
+              ansible.builtin.command: pacman -Syuw --noconfirm
+              changed_when: true
+
+            - name: Remove potentially conflicting certificate file
+              ansible.builtin.file:
+                path: /etc/ssl/certs/ca-certificates.crt
+                state: absent
+              register: cert_file_removed
+              changed_when: cert_file_removed.changed
+
+            - name: Perform system upgrade
+              ansible.builtin.command: pacman -Su --noconfirm
+              changed_when: true
+
+            - name: Reinstall ca-certificates package
+              community.general.pacman:
+                name: ca-certificates
+                state: present
+              when: not ansible.builtin.stat(path='/etc/ssl/certs/ca-certificates.crt')
+            
+            - name: Update certificate trust anchors again
+              ansible.builtin.command: update-ca-trust extract
+              changed_when: true
+          when: cert_test_result.failed
+      rescue:
+        - name: Log certificate update failure
+          ansible.builtin.debug:
+            msg: "Certificate update failed, continuing with caution"
+
+    - name: Update package mirrors
+      block:
+        - name: Backup current mirrorlist
+          ansible.builtin.copy:
+            src: /etc/pacman.d/mirrorlist
+            dest: "/etc/pacman.d/mirrorlist.backup.{{ lookup('pipe', 'date +%Y%m%d%H%M%S') }}"
+            remote_src: true
+          when: ansible.builtin.stat(path='/etc/pacman.d/mirrorlist').exists
+
+        - name: Update mirrorlist with reflector
+          ansible.builtin.command: >
+            reflector --protocol https --latest 20 --fastest 10 --score 90 --sort rate 
+            --save /etc/pacman.d/mirrorlist --verbose --country 'United States' --age 12
+          changed_when: true
+      rescue:
+        - name: Log mirror update failure
+          ansible.builtin.debug:
+            msg: "Mirror update failed, continuing with existing mirrors"
+    
+    - name: Update system packages
+      community.general.pacman:
+        update_cache: true
+        upgrade: true
+      register: pacman_update
+      changed_when: pacman_update.changed
+
+    # SECTION: SNAPPER SETUP
+    # ======================
+    - name: Set up Snapper with BTRFS Assistant
+      block:
+        - name: Check if system is using BTRFS for root
+          ansible.builtin.shell: mount | grep -q "/ type btrfs"
+          register: btrfs_check
+          changed_when: false
+          failed_when: false
+          check_mode: false
+
+        - name: Fail if root is not BTRFS
+          ansible.builtin.fail:
+            msg: "Error: Root filesystem is not BTRFS. Snapper requires BTRFS."
+          when: btrfs_check.rc != 0
+          
+        - name: Remove existing grub-btrfs if present
+          community.general.pacman:
+            name: grub-btrfs
+            state: absent
+          when: "'grub-btrfs' in ansible_facts.packages"
+        
+        - name: Remove existing systemd service files for grub-btrfsd
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          with_items:
+            - "/etc/systemd/system/grub-btrfsd.service"
+            - "/etc/systemd/system/multi-user.target.wants/grub-btrfsd.service"
+          when: ansible.builtin.stat(path=item).exists
+        
+        - name: Remove timeshift and timeshift-autosnap if present
+          community.general.pacman:
+            name: 
+              - timeshift
+              - timeshift-autosnap
+            state: absent
+          when: "'timeshift' in ansible_facts.packages or 'timeshift-autosnap' in ansible_facts.packages"
+          
+        - name: Install snapper-support and btrfs-assistant from AUR
+          include_tasks: install_aur_packages.yml
+          vars:
+            packages:
+              - "snapper-support"
+              - "btrfs-assistant"
+      when: ansible_distribution == 'Archlinux'
+
+    # SECTION: BLUETOOTH SETUP
+    # ========================
+    - name: Enable Bluetooth service
+      ansible.builtin.systemd:
+        name: bluetooth.service
+        enabled: true
+        state: started
+      register: bluetooth_status
+
+    # SECTION: PACKAGE INSTALLATION
+    # =============================
+    - name: Install system packages
+      community.general.pacman:
+        name: "{{ system_packages }}"
+        state: present
+
+    - name: Install development packages
+      community.general.pacman:
+        name: "{{ dev_packages }}"
+        state: present
+
+    - name: Install utility packages
+      community.general.pacman:
+        name: "{{ util_packages }}"
+        state: present
+    
+    # SECTION: INSTALL AUR HELPER
+    # ===========================
+    - name: Install AUR helper (yay)
+      block:
+        - name: Check if yay is already installed
+          ansible.builtin.command: command -v yay
+          register: yay_check
+          changed_when: false
+          failed_when: false
+          check_mode: false
+          
+        - name: Install git and base-devel
+          community.general.pacman:
+            name: 
+              - git
+              - base-devel
+            state: present
+          when: yay_check.rc != 0
+          
+        - name: Create build directory for yay
+          ansible.builtin.file:
+            path: /tmp/yay-build
+            state: directory
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+          when: yay_check.rc != 0
+          
+        - name: Clone yay repository
+          ansible.builtin.git:
+            repo: https://aur.archlinux.org/yay.git
+            dest: /tmp/yay-build
+          become: true
+          become_user: "{{ current_user }}"
+          when: yay_check.rc != 0
+          
+        - name: Build and install yay
+          ansible.builtin.shell: cd /tmp/yay-build && makepkg -si --noconfirm
+          become: true
+          become_user: "{{ current_user }}"
+          when: yay_check.rc != 0
+          
+        - name: Clean up build directory
+          ansible.builtin.file:
+            path: /tmp/yay-build
+            state: absent
+          when: yay_check.rc != 0
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: AUR PACKAGES INSTALLATION
+    # ==================================
+    - name: Install AUR packages
+      include_tasks: install_aur_packages.yml
+      vars:
+        packages: "{{ aur_packages }}"
+      when: ansible_distribution == 'Archlinux'
+
+    - name: Install gaming device udev rules from AUR
+      include_tasks: install_aur_packages.yml
+      vars:
+        packages: 
+          - "game-devices-udev"
+      when: ansible_distribution == 'Archlinux'
+      
+    - name: Reload udev rules after installing gaming device rules
+      ansible.builtin.shell: |
+        udevadm control --reload-rules
+        udevadm trigger
+      when: ansible_distribution == 'Archlinux'
+      
+    - name: Install Google Chrome Beta from AUR
+      include_tasks: install_aur_packages.yml
+      vars:
+        packages: 
+          - "google-chrome-beta"
+      when: ansible_distribution == 'Archlinux'
+      
+    # SECTION: FLATPAK SETUP
+    # ======================
+    - name: Install Flatpak
+      community.general.pacman:
+        name: flatpak
+        state: present
+        
+    - name: Add Flathub repository for user
+      ansible.builtin.command: flatpak remote-add --user --if-not-exists flathub {{ flathub_repo }}
+      become: true
+      become_user: "{{ current_user }}"
+      register: flathub_add
+      changed_when: "'exists' not in flathub_add.stderr"
+      failed_when: false
+      
+    - name: Install Flatpak applications
+      ansible.builtin.command: flatpak install --user -y flathub {{ item }}
+      become: true
+      become_user: "{{ current_user }}"
+      register: flatpak_install
+      changed_when: "'is already installed' not in flatpak_install.stdout"
+      failed_when: false
+      with_items: "{{ flatpak_apps }}"
+    
+    # SECTION: DOCKER SETUP
+    # ====================
+    - name: Install Docker
+      block:
+        - name: Install Docker packages
+          community.general.pacman:
+            name: "{{ docker_packages }}"
+            state: present
+            
+        - name: Enable and start Docker service
+          ansible.builtin.systemd:
+            name: docker.service
+            enabled: true
+            state: started
+            
+        - name: Create docker group
+          ansible.builtin.group:
+            name: docker
+            state: present
+            
+        - name: Add user to docker group
+          ansible.builtin.user:
+            name: "{{ current_user }}"
+            groups: docker
+            append: true
+            
+        - name: Verify Docker installation
+          ansible.builtin.command: docker run --rm hello-world
+          changed_when: false
+          register: docker_test
+          ignore_errors: true
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: PODMAN SETUP
+    # ====================
+    - name: Install Podman
+      block:
+        - name: Install Podman packages
+          community.general.pacman:
+            name: "{{ podman_packages }}"
+            state: present
+            
+        - name: Enable podman.socket service if available
+          ansible.builtin.systemd:
+            name: podman.socket
+            enabled: true
+            state: started
+          register: podman_socket
+          failed_when: false
+          
+        - name: Create containers config directory
+          ansible.builtin.file:
+            path: /etc/containers
+            state: directory
+            mode: '0755'
+            
+        - name: Configure Podman registries
+          ansible.builtin.blockinfile:
+            path: /etc/containers/registries.conf
+            create: true
+            block: |
+              # Registries configuration file - setup by installation script
+              
+              [registries.search]
+              registries = ['docker.io', 'quay.io']
+            marker: "# {mark} ANSIBLE MANAGED BLOCK"
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: PYENV SETUP
+    # ===================
+    - name: Install pyenv
+      block:
+        - name: Install pyenv and dependencies
+          community.general.pacman:
+            name:
+              - pyenv
+              - base-devel
+              - openssl
+              - zlib
+              - xz
+              - tk
+            state: present
+            
+        - name: Set up pyenv in .bashrc
+          ansible.builtin.blockinfile:
+            path: "{{ user_home }}/.bashrc"
+            create: true
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+            block: |
+              # pyenv setup
+              export PYENV_ROOT="$HOME/.pyenv"
+              [[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+              eval "$(pyenv init -)"
+            marker: "# {mark} PYENV CONFIGURATION"
+            
+        - name: Create fish configuration directory
+          ansible.builtin.file:
+            path: "{{ user_home }}/.config/fish"
+            state: directory
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+            
+        - name: Set up pyenv in fish config
+          ansible.builtin.blockinfile:
+            path: "{{ user_home }}/.config/fish/config.fish"
+            create: true
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+            block: |
+              # pyenv setup
+              set -gx PYENV_ROOT $HOME/.pyenv
+              fish_add_path $PYENV_ROOT/bin
+              status --is-interactive; and pyenv init - | source
+            marker: "# {mark} PYENV CONFIGURATION"
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: MISE SETUP
+    # ==================
+    - name: Install mise
+      block:
+        - name: Check if mise is already installed
+          ansible.builtin.command: command -v mise
+          register: mise_check
+          changed_when: false
+          failed_when: false
+          become: true
+          become_user: "{{ current_user }}"
+          
+        - name: Create fish config directories
+          ansible.builtin.file:
+            path: "{{ user_home }}/.config/fish/completions"
+            state: directory
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+          when: mise_check.rc != 0
+            
+        - name: Run mise installer
+          ansible.builtin.shell: curl -fsSL {{ mise_installer }} | sh
+          become: true
+          become_user: "{{ current_user }}"
+          when: mise_check.rc != 0
+          
+        - name: Add mise activation to fish config
+          ansible.builtin.blockinfile:
+            path: "{{ user_home }}/.config/fish/config.fish"
+            create: true
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+            block: |
+              # mise activation
+              ~/.local/bin/mise activate fish | source
+            marker: "# {mark} MISE CONFIGURATION"
+          when: mise_check.rc != 0 or not ansible.builtin.lookup('file', user_home + '/.config/fish/config.fish') | regex_search('mise activate')
+            
+        - name: Generate mise completions for fish
+          ansible.builtin.shell: ~/.local/bin/mise completion fish > ~/.config/fish/completions/mise.fish
+          become: true
+          become_user: "{{ current_user }}"
+          when: mise_check.rc != 0 or not ansible.builtin.stat(path=user_home + '/.config/fish/completions/mise.fish').exists
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: NEOVIM SETUP
+    # ====================
+    - name: Install Neovim
+      block:
+        - name: Install Neovim and dependencies
+          community.general.pacman:
+            name:
+              - neovim
+              - make
+              - gcc
+              - ripgrep
+              - unzip
+              - git
+              - xclip
+            state: present
+            
+        - name: Set up kickstart.nvim
+          ansible.builtin.git:
+            repo: https://github.com/nvim-lua/kickstart.nvim.git
+            dest: "{{ user_home }}/.config/nvim"
+          become: true
+          become_user: "{{ current_user }}"
+          when: not ansible.builtin.stat(path=user_home + '/.config/nvim/init.lua').exists
+            
+        - name: Set up Neovim aliases in fish config
+          ansible.builtin.blockinfile:
+            path: "{{ user_home }}/.config/fish/config.fish"
+            create: true
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+            block: |
+              # Neovim aliases
+              alias vim='nvim'
+              alias vi='nvim'
+            marker: "# {mark} NEOVIM ALIASES"
+            
+        - name: Set up Neovim aliases in bash config
+          ansible.builtin.blockinfile:
+            path: "{{ user_home }}/.bashrc"
+            create: true
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+            block: |
+              # Neovim aliases
+              alias vim='nvim'
+              alias vi='nvim'
+            marker: "# {mark} NEOVIM ALIASES"
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: FISH SHELL SETUP
+    # ========================
+    - name: Configure fish shell
+      block:
+        - name: Install fish shell
+          community.general.pacman:
+            name: fish
+            state: present
+            
+        - name: Set fish as default shell
+          ansible.builtin.user:
+            name: "{{ current_user }}"
+            shell: /usr/bin/fish
+            
+        - name: Create fish config directory
+          ansible.builtin.file:
+            path: "{{ user_home }}/.config/fish"
+            state: directory
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+            
+        - name: Create initial fish config
+          ansible.builtin.copy:
+            dest: "{{ user_home }}/.config/fish/config.fish"
+            owner: "{{ current_user }}"
+            group: "{{ current_user }}"
+            force: false
+            content: |
+              # Fish shell configuration
+              
+              # Add user's private bin to PATH if it exists
+              if test -d "$HOME/bin"
+                 fish_add_path "$HOME/bin"
+              end
+              
+              if test -d "$HOME/.local/bin"
+                 fish_add_path "$HOME/.local/bin"
+              end
+              
+              # Set environment variables
+              set -gx EDITOR nvim
+              
+              # Custom aliases
+              alias ll='ls -la'
+              alias la='ls -A'
+              alias l='ls -CF'
+              
+              # Fish greeting
+              function fish_greeting
+                 echo "Welcome to Fish shell!"
+              end
+              
+              # Load local config if exists
+              if test -f "$HOME/.config/fish/local.fish"
+                 source "$HOME/.config/fish/local.fish"
+              end
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: FISHER SETUP
+    # ====================
+    - name: Install Fisher plugin manager
+      block:
+        - name: Check if Fisher is already installed
+          ansible.builtin.shell: fish -c 'type -q fisher'
+          register: fisher_check
+          changed_when: false
+          failed_when: false
+          become: true
+          become_user: "{{ current_user }}"
+          
+        - name: Install Fisher plugin manager for Fish
+          ansible.builtin.shell: curl -sL https://raw.githubusercontent.com/jorgebucaran/fisher/main/functions/fisher.fish | fish -c 'source && fisher install jorgebucaran/fisher'
+          become: true
+          become_user: "{{ current_user }}"
+          when: fisher_check.rc != 0
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: LUA SETUP
+    # =================
+    - name: Install Lua and LuaRocks
+      block:
+        - name: Install Lua and dependencies
+          community.general.pacman:
+            name:
+              - lua
+              - luarocks
+              - "{{ lua_dependencies }}"
+            state: present
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: KVM/LIBVIRT SETUP
+    # =========================
+    - name: Install KVM/libvirt
+      block:
+        - name: Install KVM and libvirt packages
+          community.general.pacman:
+            name: "{{ kvm_packages }}"
+            state: present
+            
+        - name: Enable and start virtualization services
+          ansible.builtin.systemd:
+            name: "{{ item }}"
+            enabled: true
+            state: started
+          with_items:
+            - libvirtd.service
+            - virtlogd.service
+            
+        - name: Add user to libvirt group
+          ansible.builtin.user:
+            name: "{{ current_user }}"
+            groups: libvirt
+            append: true
+            
+        - name: Configure default network
+          ansible.builtin.shell: |
+            if ! virsh net-info default &>/dev/null; then
+              virsh net-define /etc/libvirt/qemu/networks/default.xml &>/dev/null || true
+            fi
+            if ! virsh net-info default | grep -q "Active:.*yes"; then
+              virsh net-start default &>/dev/null || true
+            fi
+            virsh net-autostart default &>/dev/null
+          changed_when: true
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: FINAL SYSTEM UPDATE
+    # ===========================
+    - name: Perform final system update
+      block:
+        - name: Update and upgrade all packages
+          community.general.pacman:
+            update_cache: true
+            upgrade: true
+          register: final_update
+            
+        - name: Clean package cache
+          ansible.builtin.command: pacman -Sc --noconfirm
+          changed_when: true
+      when: ansible_distribution == 'Archlinux'
+    
+    # SECTION: COMPLETION MESSAGE
+    # ==========================
+    - name: Print completion message
+      ansible.builtin.debug:
+        msg: |
+          ======================================================================
+          SYSTEM UPDATE COMPLETED SUCCESSFULLY
+          
+          To install NVIDIA drivers, run the following command:
+              sudo nvidia-inst --32
+          
+          After NVIDIA installation completes, reboot your system with:
+              sudo reboot
+          
+          Note: You may need to log out and back in for the following changes to take effect:
+          - Docker group membership
+          - pyenv initialization
+          - mise initialization
+          - Default shell change to fish
+          ======================================================================
+
+# Create auxiliary file for AUR package installation
+- name: Create AUR installation task file
+  hosts: localhost
+  connection: local
+  tasks:
+    - name: Create install_aur_packages.yml
+      ansible.builtin.copy:
+        dest: install_aur_packages.yml
+        content: |
+          ---
+          # This task installs packages from AUR safely
+          - name: Check if packages are already installed
+            ansible.builtin.command: pacman -Qi {{ item }}
+            register: pkg_check
+            changed_when: false
+            failed_when: false
+            loop: "{{ packages }}"
+            
+          - name: Create temporary sudoers file for AUR installation
+            ansible.builtin.copy:
+              content: "{{ current_user }} ALL=(ALL) NOPASSWD: /usr/bin/pacman"
+              dest: "/etc/sudoers.d/10_{{ current_user }}_temp"
+              mode: '0440'
+            
+          - name: Install packages with yay
+            ansible.builtin.shell: yay -S {{ item.item }} --noconfirm
+            become: true
+            become_user: "{{ current_user }}"
+            loop: "{{ pkg_check.results }}"
+            when: item.rc != 0
+            register: yay_result
+            failed_when: false
+            
+          - name: Remove temporary sudoers file
+            ansible.builtin.file:
+              path: "/etc/sudoers.d/10_{{ current_user }}_temp"
+              state: absent
