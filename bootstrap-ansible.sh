@@ -23,12 +23,12 @@ REPO_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 echo "==> Setting up environment for user: $ACTUAL_USER"
 echo "==> Repository location: $REPO_DIR"
 
+# Define user's local bin path
+LOCAL_BIN_PATH="$USER_HOME/.local/bin"
+
 # Install uv as the user (not as root)
 echo "==> Installing uv package manager for user $ACTUAL_USER"
 su - "$ACTUAL_USER" -c "curl -LsSf https://astral.sh/uv/install.sh | sh"
-
-# Define user's local bin path
-LOCAL_BIN_PATH="$USER_HOME/.local/bin"
 
 # Add uv to user's PATH for future sessions
 if ! grep -q "\.local/bin" "$USER_HOME/.bashrc"; then
@@ -36,11 +36,19 @@ if ! grep -q "\.local/bin" "$USER_HOME/.bashrc"; then
     echo "==> Added ~/.local/bin to PATH in .bashrc for future sessions"
 fi
 
-# Create a virtual environment for Ansible
-echo "==> Creating virtual environment for Ansible"
+# First install Python using uv
+echo "==> Installing Python 3.13.3 using uv"
+su - "$ACTUAL_USER" -c "$LOCAL_BIN_PATH/uv python install 3.13.3"
+
+# Get the full path to the installed Python
+echo "==> Locating installed Python"
+PYTHON_PATH=$(su - "$ACTUAL_USER" -c "$LOCAL_BIN_PATH/uv python executable 3.13.3")
+echo "==> Using Python at: $PYTHON_PATH"
+
+# Create a virtual environment for Ansible using the specific Python interpreter
+echo "==> Creating virtual environment for Ansible with uv Python"
 su - "$ACTUAL_USER" -c "mkdir -p $USER_HOME/.venvs"
-# Use full path to uv for reliability
-su - "$ACTUAL_USER" -c "$LOCAL_BIN_PATH/uv venv $USER_HOME/.venvs/ansible"
+su - "$ACTUAL_USER" -c "$LOCAL_BIN_PATH/uv venv --python $PYTHON_PATH $USER_HOME/.venvs/ansible"
 
 # Use full path to install ansible-core
 echo "==> Installing ansible-core using uv tool install"
@@ -101,6 +109,7 @@ cd "$REPO_DIR"
 # Print status
 echo "Ansible environment activated in \$PWD"
 echo "Repository directory: $REPO_DIR"
+echo "Using Python: \$(python --version)"
 echo ""
 echo "Available playbooks:"
 find . -maxdepth 1 -name "*.yml" | sed 's|./||'
